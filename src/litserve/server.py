@@ -27,6 +27,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from multiprocessing.context import Process
+from threading import Thread
 from queue import Empty
 from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 
@@ -587,6 +588,7 @@ class LitServer:
         finally:
             print("Shutting down LitServe")
             for iw in inference_workers:
+                iw: Process
                 iw.terminate()
                 iw.join()
             manager.shutdown()
