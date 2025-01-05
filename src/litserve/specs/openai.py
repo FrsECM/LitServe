@@ -262,6 +262,10 @@ class OpenAISpec(LitSpec):
         self.add_endpoint("/v1/chat/completions", self.chat_completion, ["POST"])
         self.add_endpoint("/v1/chat/completions", self.options_chat_completions, ["OPTIONS"])
 
+    @property
+    def stream(self):
+        return True
+
     def pre_setup(self, lit_api: "LitAPI"):
         from litserve import LitAPI
 
@@ -439,6 +443,7 @@ class OpenAISpec(LitSpec):
                 logger.debug(encoded_response)
                 chat_msg = ChatMessage(**encoded_response)
                 usage = UsageInfo(**encoded_response)
+                usage_infos.append(usage)  # Aggregate usage info across all choices
                 msgs.append(chat_msg.content)
                 if chat_msg.tool_calls:
                     tool_calls = chat_msg.tool_calls
@@ -447,6 +452,5 @@ class OpenAISpec(LitSpec):
             msg = {"role": "assistant", "content": content, "tool_calls": tool_calls}
             choice = ChatCompletionResponseChoice(index=i, message=msg, finish_reason="stop")
             choices.append(choice)
-            usage_infos.append(usage)  # Only use the last item from encode_response
 
         return ChatCompletionResponse(model=model, choices=choices, usage=sum(usage_infos))
