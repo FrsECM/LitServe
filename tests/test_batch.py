@@ -26,7 +26,8 @@ from httpx import ASGITransport, AsyncClient
 import litserve as ls
 from litserve import LitAPI, LitServer
 from litserve.callbacks import CallbackRunner
-from litserve.loops import collate_requests, run_batched_loop
+from litserve.loops.base import collate_requests
+from litserve.loops.simple_loops import BatchedLoop
 from litserve.utils import wrap_litserve_start
 
 NOOP_CB_RUNNER = CallbackRunner()
@@ -169,7 +170,7 @@ def test_batch_predict_string_warning():
 
 
 class FakeResponseQueue:
-    def put(self, *args):
+    def put(self, *args, block=True, timeout=None):
         raise StopIteration("exit loop")
 
 
@@ -187,8 +188,9 @@ def test_batched_loop():
     lit_api_mock.unbatch = MagicMock(side_effect=lambda x: x)
     lit_api_mock.encode_response = MagicMock(side_effect=lambda x: {"output": x})
 
+    loop = BatchedLoop()
     with patch("pickle.dumps", side_effect=StopIteration("exit loop")), pytest.raises(StopIteration, match="exit loop"):
-        run_batched_loop(
+        loop.run_batched_loop(
             lit_api_mock,
             lit_api_mock,
             requests_queue,
@@ -224,3 +226,30 @@ def test_collate_requests(batch_timeout, batch_size):
     )
     assert len(payloads) == batch_size, f"Should have {batch_size} payloads, got {len(payloads)}"
     assert len(timed_out_uids) == 0, "No timed out uids"
+
+
+class BatchSizeMismatchAPI(SimpleBatchLitAPI):
+    def predict(self, x):
+        assert len(x) == 2, "Expected two concurrent inputs to be batched"
+        return self.model(x)  # returns a list of length same as len(x)
+
+    def unbatch(self, output):
+        return [output]  # returns a list of length 1
+
+
+@pytest.mark.asyncio
+async def test_batch_size_mismatch():
+    api = BatchSizeMismatchAPI()
+    server = LitServer(api, accelerator="cpu", devices=1, timeout=10, max_batch_size=2, batch_timeout=4)
+
+    with wrap_litserve_start(server) as server:
+        async with LifespanManager(server.app) as manager, AsyncClient(
+            transport=ASGITransport(app=manager.app), base_url="http://test"
+        ) as ac:
+            response1 = ac.post("/predict", json={"input": 4.0})
+            response2 = ac.post("/predict", json={"input": 5.0})
+            response1, response2 = await asyncio.gather(response1, response2)
+        assert response1.status_code == 500
+        assert response2.status_code == 500
+        assert response1.json() == {"detail": "Batch size mismatch"}, "unbatch a list of length 1 when batch size is 2"
+        assert response2.json() == {"detail": "Batch size mismatch"}, "unbatch a list of length 1 when batch size is 2"

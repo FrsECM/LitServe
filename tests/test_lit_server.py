@@ -61,9 +61,10 @@ def test_device_identifiers_error(simple_litapi, devices):
         LitServer(simple_litapi, accelerator="cuda", devices=devices, timeout=10)
 
 
+@pytest.mark.parametrize("use_zmq", [True, False])
 @pytest.mark.asyncio
-async def test_stream(simple_stream_api):
-    server = LitServer(simple_stream_api, stream=True, timeout=10)
+async def test_stream(simple_stream_api, use_zmq):
+    server = LitServer(simple_stream_api, stream=True, timeout=10, fast_queue=use_zmq)
     expected_output1 = "prompt=Hello generated_output=LitServe is streaming output".lower().replace(" ", "")
     expected_output2 = "prompt=World generated_output=LitServe is streaming output".lower().replace(" ", "")
 
@@ -71,6 +72,9 @@ async def test_stream(simple_stream_api):
         async with LifespanManager(server.app) as manager, AsyncClient(
             transport=ASGITransport(app=manager.app), base_url="http://test"
         ) as ac:
+            # TODO: remove this sleep when we have a better way to check if the server is ready
+            # TODO: main process can only consume when response_queue_to_buffer is ready
+            await asyncio.sleep(4)
             resp1 = ac.post("/predict", json={"prompt": "Hello"}, timeout=10)
             resp2 = ac.post("/predict", json={"prompt": "World"}, timeout=10)
             resp1, resp2 = await asyncio.gather(resp1, resp2)
@@ -84,9 +88,12 @@ async def test_stream(simple_stream_api):
             )
 
 
+@pytest.mark.parametrize("use_zmq", [True, False])
 @pytest.mark.asyncio
-async def test_batched_stream_server(simple_batched_stream_api):
-    server = LitServer(simple_batched_stream_api, stream=True, max_batch_size=4, batch_timeout=2, timeout=30)
+async def test_batched_stream_server(simple_batched_stream_api, use_zmq):
+    server = LitServer(
+        simple_batched_stream_api, stream=True, max_batch_size=4, batch_timeout=2, timeout=30, fast_queue=use_zmq
+    )
     expected_output1 = "Hello LitServe is streaming output".lower().replace(" ", "")
     expected_output2 = "World LitServe is streaming output".lower().replace(" ", "")
 
@@ -221,39 +228,58 @@ def test_start_server(mock_uvicon):
     assert server.lit_spec.response_queue_id is not None, "response_queue_id must be generated"
 
 
+@pytest.fixture
+def server_for_api_worker_test(simple_litapi):
+    server = ls.LitServer(simple_litapi, devices=1)
+    server.verify_worker_status = MagicMock()
+    server.launch_inference_worker = MagicMock(return_value=[MagicMock(), [MagicMock()]])
+    server._start_server = MagicMock()
+    return server
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="Test is only for Unix")
 @patch("litserve.server.uvicorn")
-def test_server_run_with_api_server_worker_type(mock_uvicorn):
-    api = ls.test_examples.SimpleLitAPI()
-    server = ls.LitServer(api, devices=1)
+def test_server_run_with_api_server_worker_type(mock_uvicorn, server_for_api_worker_test):
+    server = server_for_api_worker_test
+
+    server.run(api_server_worker_type="process", num_api_servers=10)
+    server.launch_inference_worker.assert_called_with(10)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Test is only for Unix")
+@pytest.mark.parametrize(("api_server_worker_type", "num_api_workers"), [(None, 1), ("process", 1)])
+@patch("litserve.server.uvicorn")
+def test_server_run_with_process_api_worker(
+    mock_uvicorn, api_server_worker_type, num_api_workers, server_for_api_worker_test
+):
+    server = server_for_api_worker_test
+
+    server.run(api_server_worker_type=api_server_worker_type, num_api_workers=num_api_workers)
+    server.launch_inference_worker.assert_called_with(num_api_workers)
+    actual = server._start_server.call_args
+    assert actual[0][4] == "process", "Server should run in process mode"
+    mock_uvicorn.Config.assert_called()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Test is only for Unix")
+@patch("litserve.server.uvicorn")
+def test_server_run_with_thread_api_worker(mock_uvicorn, server_for_api_worker_test):
+    server = server_for_api_worker_test
+    server.run(api_server_worker_type="thread")
+    server.launch_inference_worker.assert_called_with(1)
+    assert server._start_server.call_args[0][4] == "thread", "Server should run in thread mode"
+    mock_uvicorn.Config.assert_called()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Test is only for Unix")
+def test_server_run_with_invalid_api_worker(simple_litapi):
+    server = ls.LitServer(simple_litapi, devices=1)
     server.verify_worker_status = MagicMock()
     with pytest.raises(ValueError, match=r"Must be 'process' or 'thread'"):
         server.run(api_server_worker_type="invalid")
 
     with pytest.raises(ValueError, match=r"must be greater than 0"):
         server.run(num_api_servers=0)
-
-    server.launch_inference_worker = MagicMock(return_value=[MagicMock(), [MagicMock()]])
-    server._start_server = MagicMock()
-
-    # Running the method to test
-    server.run(api_server_worker_type=None)
-    server.launch_inference_worker.assert_called_with(1)
-    actual = server._start_server.call_args
-    assert actual[0][4] == "process", "Server should run in process mode"
-
-    server.run(api_server_worker_type="thread")
-    server.launch_inference_worker.assert_called_with(1)
-    actual = server._start_server.call_args
-    assert actual[0][4] == "thread", "Server should run in thread mode"
-
-    server.run(api_server_worker_type="process")
-    server.launch_inference_worker.assert_called_with(1)
-    actual = server._start_server.call_args
-    assert actual[0][4] == "process", "Server should run in process mode"
-
-    server.run(api_server_worker_type="process", num_api_servers=10)
-    server.launch_inference_worker.assert_called_with(10)
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Test is only for Windows")
@@ -265,7 +291,6 @@ def test_server_run_windows(mock_uvicorn):
     server.launch_inference_worker = MagicMock(return_value=[MagicMock(), [MagicMock()]])
     server._start_server = MagicMock()
 
-    # Running the method to test
     server.run(api_server_worker_type=None)
     actual = server._start_server.call_args
     assert actual[0][4] == "thread", "Windows only supports thread mode"
@@ -461,13 +486,13 @@ class TestHTTPExceptionAPI2(ls.test_examples.SimpleLitAPI):
 
 
 def test_http_exception():
-    server = LitServer(TestHTTPExceptionAPI())
+    server = LitServer(TestHTTPExceptionAPI(), fast_queue=True)
     with wrap_litserve_start(server) as server, TestClient(server.app) as client:
         response = client.post("/predict", json={"input": 4.0})
         assert response.status_code == 501, "Server raises 501 error"
         assert response.text == '{"detail":"decode request is bad"}', "decode request is bad"
 
-    server = LitServer(TestHTTPExceptionAPI2())
+    server = LitServer(TestHTTPExceptionAPI2(), fast_queue=True)
     with wrap_litserve_start(server) as server, TestClient(server.app) as client:
         response = client.post("/predict", json={"input": 4.0})
         assert response.status_code == 400, "Server raises 400 error"
@@ -494,8 +519,9 @@ class FailFastAPI(ls.test_examples.SimpleLitAPI):
         raise ValueError("setup failed")
 
 
-def test_workers_setup_status():
+@pytest.mark.parametrize("use_zmq", [True, False])
+def test_workers_setup_status(use_zmq):
     api = FailFastAPI()
-    server = LitServer(api, devices=1)
+    server = LitServer(api, devices=1, fast_queue=use_zmq)
     with pytest.raises(RuntimeError, match="One or more workers failed to start. Shutting down LitServe"):
         server.run()
