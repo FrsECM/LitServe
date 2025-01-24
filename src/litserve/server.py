@@ -247,7 +247,7 @@ class LitServer:
         self.model_metadata = model_metadata
         self._connector = _Connector(accelerator=accelerator, devices=devices)
         self._callback_runner = CallbackRunner(callbacks)
-        self._uvicorn_servers:List[uvicorn.Server] = []
+        self._uvicorn_servers: List[uvicorn.Server] = []
         self.use_zmq = fast_queue
 
         specs = spec if spec is not None else []
